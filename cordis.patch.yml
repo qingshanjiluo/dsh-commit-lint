@@ -1,0 +1,5 @@
+﻿- insert:
+    - id: commit-lint
+      name: dsh-commit-lint
+      config:
+        enabled: true
