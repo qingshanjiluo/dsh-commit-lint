@@ -1,3 +1,14 @@
+/**
+ * dsh-commit-lint — 提交消息检查
+ *
+ * 功能：
+ * 1. Conventional Commit格式验证
+ * 2. 批量检查
+ *
+ * 工具：lint_commit, lint_staged
+ * 命令：/commit-lint
+ * 配置：enabled
+ */
 import { execSync } from 'node:child_process';
 import { z } from 'zod';
 
