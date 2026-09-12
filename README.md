@@ -6,9 +6,8 @@
 
 ## ✨ 功能特性
 
-- ✅ **格式验证**: 检查是否符合 Conventional Commits 规范
-- 📋 **批量检查**: 检查最近多次提交的消息格式
-- 🔍 **详细反馈**: 提供具体的错误和警告信息
+- ✅ **提交检查**: 检查提交消息格式
+- 📋 **暂存区检查**: 检查暂存区文件
 
 ## 📦 安装
 
@@ -20,17 +19,12 @@ npm install dsh-commit-lint
 
 | 工具名 | 描述 | 参数 |
 |--------|------|------|
-| `lint_commit` | 验证提交消息 | `message` |
-| `lint_staged` | 检查最近提交 | 无 |
+| `lint_commit` | 检查提交消息 | — |
+| `lint_staged` | 检查暂存区 | — |
 
 ## 📋 命令
 
-- `/commit-lint check` — 检查最近提交
-- `/commit-lint staged` — 检查所有
-
-## 有效类型
-
-`feat` `fix` `docs` `style` `refactor` `perf` `test` `build` `ci` `chore` `revert`
+- `/commit-lint` — 提交消息检查
 
 ## ⚙️ 配置
 

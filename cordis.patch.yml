@@ -1,5 +1,8 @@
-﻿- insert:
+# dsh-commit-lint bundle layer: inserts the host tool plugin into a profile's
+# layer stack. Install with:
+#   npx -y @deepseek-ai/dsh plugin --profile web add @qingshanjiluo/dsh-commit-lint
+- insert:
     - id: commit-lint
-      name: dsh-commit-lint
+      name: '@qingshanjiluo/dsh-commit-lint'
       config:
-        enabled: true
+        maxSubjectLength: 72

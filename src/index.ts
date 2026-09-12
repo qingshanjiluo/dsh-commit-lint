@@ -1,100 +1,172 @@
 /**
- * dsh-commit-lint — 提交消息检查
- *
- * 功能：
- * 1. Conventional Commit格式验证
- * 2. 批量检查
- *
- * 工具：lint_commit, lint_staged
- * 命令：/commit-lint
- * 配置：enabled
+ * Conventional-commit linter for DeepSeek Harness. `lint_commit` validates one
+ * commit message against the Conventional Commits grammar and a configurable
+ * subject budget; `lint_staged` reviews a caller-supplied list of staged paths
+ * for sizes and sensitive-looking names that usually deserve a second look.
+ * Both tools are pure — they shell out to nothing — so the plugin carries no
+ * host process or filesystem dependency.
+ * @module @deepseek-ai/dsh-commit-lint
  */
-import { execSync } from 'node:child_process';
-import { z } from 'zod';
 
-export const name = 'dsh-commit-lint';
-export const inject = ['settings', 'tools', 'commands'];
-const configSchema = z.object({ enabled: z.boolean().default(true), allowScopes: z.string().default('') });
+import type { Context } from '@deepseek-ai/cordis'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import z from '@deepseek-ai/schemastery'
 
-function getLastCommitMessage(): string {
-  try { return execSync('git log -1 --pretty=%s', { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim(); } catch { return ''; }
+export const name = 'dsh-commit-lint'
+export const inject = ['tools']
+
+/** Deployment policy for the commit linter. */
+export interface Config {
+  /**
+   * Maximum subject-line length counted from the start of the message to the
+   * first newline. Bodies are not length-checked.
+   */
+  maxSubjectLength: number
 }
 
-function validateCommit(message: string): { valid: boolean; errors: string[]; warnings: string[] } {
-  const errors: string[] = [];
-  const warnings: string[] = [];
-  const pattern = /^(\w+)(\(.+\))?(!)?:\s+.+/;
-  if (!pattern.test(message)) {
-    errors.push('不符合 Conventional Commits 格式: <type>(<scope>): <description>');
+/** Schemastery configuration for the commit linter. */
+export const Config: z<Config> = z.object({
+  maxSubjectLength: z.number().default(72),
+})
+
+const TYPES = [
+  'feat', 'fix', 'docs', 'style', 'refactor', 'perf',
+  'test', 'build', 'ci', 'chore', 'revert',
+] as const
+
+const HEADER = /^(?<type>[a-z]+)(?:\((?<scope>[^()]*)\))?(?<breaking>!)?: (?<subject>.+)$/
+
+/**
+ * Lint one commit message against Conventional Commits.
+ * @param message - the raw commit message.
+ * @param maxSubjectLength - subject budget from {@link Config}.
+ * @returns validity plus every violation found, in check order.
+ */
+function lintMessage(message: string, maxSubjectLength: number): { valid: boolean; errors: string[] } {
+  const errors: string[] = []
+  const trimmed = message.replace(/\s+$/, '')
+  if (trimmed.length === 0) {
+    errors.push('message is empty')
+    return { valid: false, errors }
   }
-  const typeMatch = message.match(/^(\w+)/);
-  if (typeMatch) {
-    const validTypes = ['feat', 'fix', 'docs', 'style', 'refactor', 'perf', 'test', 'build', 'ci', 'chore', 'revert'];
-    if (!validTypes.includes(typeMatch[1])) {
-      errors.push(`无效的类型 "${typeMatch[1]}"。有效类型: ${validTypes.join(', ')}`);
+  const subjectLine = trimmed.split(/\r?\n/, 1)[0]
+  const header = HEADER.exec(subjectLine)
+  if (!header) {
+    errors.push('subject must match `<type>[optional scope][!]: <summary>`')
+  } else {
+    const { type, scope, subject } = header.groups as { type: string; scope?: string; subject: string }
+    if (!TYPES.includes(type as (typeof TYPES)[number])) {
+      errors.push(`unknown type "${type}"; expected one of ${TYPES.join(', ')}`)
+    }
+    if (scope !== undefined && scope.trim().length === 0) errors.push('scope must be non-empty when present')
+    if (!/^[a-z]/.test(subject)) errors.push('subject must start with a lowercase letter')
+    if (subject.length > maxSubjectLength) {
+      errors.push(`subject is ${subject.length} chars, over the ${maxSubjectLength} limit`)
     }
   }
-  if (message.length > 72) warnings.push('提交消息超过 72 字符');
-  if (message.includes('  ')) warnings.push('包含连续空格');
-  if (/\d{7,}/.test(message)) warnings.push('包含过长数字序列');
-  return { valid: errors.length === 0, errors, warnings };
+  if (subjectLine.endsWith('.')) errors.push('subject must not end with a period')
+  return { valid: errors.length === 0, errors }
 }
 
-function validateStagedCommits(): { hash: string; message: string; valid: boolean; errors: string[] }[] {
-  try {
-    const output = execSync('git log --oneline -10', { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-    return output.split('\n').map(line => {
-      const [hash, ...rest] = line.split(' ');
-      const message = rest.join(' ');
-      const result = validateCommit(message);
-      return { hash, message, ...result };
-    });
-  } catch { return []; }
+const SECRET_NAME = /(^|[._-])(\.?env|secret|credential|token|password|private[-_.]?key|id[-_.]?rsa|\.npmrc|\.netrc)([._-]|$)/i
+const BUILD_ARTIFACT = /\.(o|a|so|dll|dylib|class|jar|war|pyc|bundle|min\.js|map)$/i
+
+/**
+ * Flag risky staged paths supplied by the caller (typically `git diff --cached
+ * --name-only`). No git subprocess is run; the model provides the list.
+ * @param files - staged paths.
+ * @returns count and per-path warnings.
+ */
+function reviewStaged(files: readonly string[]): { count: number; warnings: string[] } {
+  const warnings: string[] = []
+  for (const file of files) {
+    if (SECRET_NAME.test(file)) warnings.push(`${file}: looks sensitive — confirm it is not a real secret before committing`)
+    if (BUILD_ARTIFACT.test(file)) warnings.push(`${file}: build artifact is usually not tracked`)
+    if (file.length > 200) warnings.push(`${file}: unusually long path`)
+  }
+  if (files.length > 300) warnings.push(`${files.length} staged files — consider splitting the commit`)
+  return { count: files.length, warnings }
 }
 
-export function apply(ctx: any, config: Config) {
-  if (!config.enabled) return;
-  ctx.effect(() => ctx.tools.register({
-    name: 'lint_commit', description: '验证提交消息是否符合 Conventional Commits 规范。',
-    parameters: { message: { type: 'string', description: '提交消息（不填则检查最近一次提交）' } },
-    output: { schema: { type: 'json' }, render: (_a: unknown, v: unknown) => {
-      const r = v as any;
-      const icon = r.valid ? '✅' : '❌';
-      const lines = [`${icon} 提交消息: \`${r.message}\``];
-      if (r.errors.length) lines.push('错误:\n' + r.errors.map((e: string) => `- ❌ ${e}`).join('\n'));
-      if (r.warnings.length) lines.push('警告:\n' + r.warnings.map((w: string) => `- ⚠️ ${w}`).join('\n'));
-      return [{ type: 'text', text: lines.join('\n') }];
-    }},
-    async execute(args: { message?: string }) {
-      const msg = args.message || getLastCommitMessage();
-      if (!msg) throw new Error('没有找到提交消息');
-      return { message: msg, ...validateCommit(msg) };
+/**
+ * Register the commit-lint tools on `ctx.tools`.
+ * @param ctx - registrant context carrying the tool registry.
+ * @param config - deployment's explicit linter policy.
+ */
+export function apply(ctx: Context, config: Config): void {
+  ctx.tools.register(defineTool({
+    name: 'lint_commit',
+    description:
+      'Check one commit message against the Conventional Commits grammar and the ' +
+      'configured subject length. Pass the full message; it reports every violation.',
+    parameters: {
+      message: { type: 'string', required: true, description: 'The complete commit message (subject line and body).' },
     },
-  }), 'dsh-commit-lint: lint');
-  ctx.effect(() => ctx.tools.register({
-    name: 'lint_staged', description: '检查最近提交的消息格式。',
-    output: { schema: { type: 'json' }, render: (_a: unknown, v: unknown) => {
-      const r = v as any[];
-      const valid = r.filter(c => c.valid).length;
-      const failed = r.filter(c => !c.valid).length;
-      const lines = [`## 提交检查 (${valid}/${r.length} 通过)`];
-      for (const c of r) {
-        const icon = c.valid ? '✅' : '❌';
-        lines.push(`${icon} \`${c.hash}\` ${c.message}`);
-        if (c.errors.length) lines.push(`   ${c.errors.join(', ')}`);
-      }
-      return [{ type: 'text', text: lines.join('\n') }];
-    }},
-    async execute() { return validateStagedCommits(); },
-  }), 'dsh-commit-lint: staged');
-  ctx.effect(() => ctx.commands.register({
-    name: 'commit-lint', description: '提交消息检查', input: { hint: 'check | staged' },
-    async handler() {
-      const msg = getLastCommitMessage();
-      if (!msg) return { kind: 'text', text: '没有提交' };
-      const r = validateCommit(msg);
-      return { kind: 'text', text: r.valid ? `✅ ${msg}` : `❌ ${r.errors.join(', ')}` };
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          valid: { type: 'boolean', required: true, description: 'Whether the message passes every check.' },
+          errors: {
+            type: 'array',
+            required: true,
+            description: 'Violations in check order; empty when valid.',
+            items: { type: 'string' },
+          },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.valid
+          ? 'Commit message is valid.'
+          : `Commit message has ${value.errors.length} issue(s):\n- ${value.errors.join('\n- ')}`,
+      }],
     },
-  }), 'dsh-commit-lint: command');
-  ctx.inject(['settings'], (sctx: any) => { const { settingsNamespace } = require('@deepseek-ai/dsh-settings'); sctx.settings.register(settingsNamespace('commit-lint'), configSchema, { base: config, expose: true, applies: 'live' }); });
+    isConcurrencySafe: () => true,
+    execute(args) {
+      return Promise.resolve(lintMessage(args.message, config.maxSubjectLength))
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'lint_staged',
+    description:
+      'Review a list of staged file paths for sensitive-looking names, build ' +
+      'artifacts, and over-large commits. Supply the paths yourself (for example ' +
+      'from `git diff --cached --name-only`); the tool runs no git command.',
+    parameters: {
+      files: {
+        type: 'array',
+        required: true,
+        description: 'Staged file paths to review.',
+        items: { type: 'string' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          count: { type: 'integer', required: true, description: 'Number of paths reviewed.' },
+          warnings: {
+            type: 'array',
+            required: true,
+            description: 'Per-path advisories; empty when nothing is flagged.',
+            items: { type: 'string' },
+          },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.warnings.length === 0
+          ? `${value.count} staged file(s), nothing flagged.`
+          : `${value.count} staged file(s):\n- ${value.warnings.join('\n- ')}`,
+      }],
+    },
+    isConcurrencySafe: () => true,
+    execute(args) {
+      return Promise.resolve(reviewStaged(args.files))
+    },
+  }))
 }
